@@ -215,52 +215,24 @@ def find_action_boundaries(
 ) -> list[tuple[int, int]]:
     """Identify action segment boundaries using the specified zero-segment logic.
 
-    1. Convert data to uV (assuming OpenBCI 1x gain, 1 count = 0.5364 uV).
-    2. Treat fluctuations < 1000 uV as 0 (pause regions).
-    3. Find all 0 segments, measure lengths, sort, and pick the top 101 longest.
-    4. Sort these top 101 zero segments chronologically.
-    5. The 100 regions between these zero segments are the action bounds.
-    6. Ensure all action segments are padded from original data to equal the longest action length.
+    1. Compute the per-sample fluctuation envelope on ch1-4.
+    2. Treat fluctuation values < 1000 as 0 (pause regions).
+    3. Find all zero blocks, measure lengths, and pick the top 101 longest.
+    4. Sort these zero blocks chronologically.
+    5. The 100 regions between adjacent zero blocks are the action bounds.
+    6. Pad each action interval symmetrically on the original data to match the longest action.
     """
     exg = data[:, 1:5]
-    
-    # 1. Convert to uV for 1x Gain 
-    uV = exg * 0.5364
-    
-    # 2. Use the differential (fluctuation) to find rest (0) segments, not absolute DC level.
-    diffs = np.max(np.abs(np.diff(uV, axis=0)), axis=1)
-    
-    # Applying a small smoothing helps prevent tiny noise spikes from breaking long pauses
-    # Pad diffs so it aligns with the original array size
+
+    # Use inter-sample fluctuation to identify pause regions rather than absolute level.
+    diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
     diffs_padded = np.append(diffs, diffs[-1])
-    envelope = np.convolve(diffs_padded, np.ones(10)/10, mode='same')
-    
-    # Grid search for the optimal threshold ratio to find EXACTLY `segments_per_file + 1` gaps
-    med_env = np.median(envelope)
-    best_th, best_cnt = med_env, 0
-    target_pauses = segments_per_file + 1
-    
-    for ratio in np.linspace(0.1, 20.0, 400):
-        th = med_env * ratio
-        is_z = envelope < th
-        b = 0
-        i = 0
-        while i < len(is_z):
-            if is_z[i]:
-                st = i
-                while i < len(is_z) and is_z[i]: i += 1
-                if i - st > 50: b += 1
-            else: i += 1
-        
-        if abs(target_pauses - b) < abs(target_pauses - best_cnt) or (b == target_pauses and best_cnt != target_pauses):
-            best_cnt = b
-            best_th = th
-            if best_cnt == target_pauses: break
-            
-    # 1. 动态寻找最佳基线，使过滤后的长停顿恰好有 target_pauses 段
-    is_zero = envelope < best_th
-    
-    # 2. 找出所有的0段并标记位置, 测量长度
+    envelope = np.convolve(diffs_padded, np.ones(10) / 10, mode="same")
+
+    zero_threshold = 1000.0
+    is_zero = envelope < zero_threshold
+
+    # Find all zero blocks and measure their lengths.
     blocks = []
     i = 0
     while i < len(is_zero):
@@ -268,53 +240,47 @@ def find_action_boundaries(
             start = i
             while i < len(is_zero) and is_zero[i]:
                 i += 1
-            blocks.append((start, i - start))  # (start_index, length)
+            blocks.append((start, i - start))
         else:
             i += 1
-            
-    # 3. 排序, 选取(segments_per_file + 1) 个最长的0段
+
     blocks.sort(key=lambda x: x[1], reverse=True)
-    
-    required_pauses = min(segments_per_file + 1, len(blocks))
-    if required_pauses <= 1:
-        raise ValueError(f"Found only {len(blocks)} zero blocks (threshold 1000uV), not enough to extract segments.")
-        
-    actual_segments = required_pauses - 1
-    
+    required_pauses = segments_per_file + 1
+    if len(blocks) < required_pauses:
+        raise ValueError(
+            f"Found only {len(blocks)} zero blocks with threshold {zero_threshold}, "
+            f"not enough to extract {segments_per_file} segments."
+        )
+
     top_pauses = blocks[:required_pauses]
-    
-    # 4. 排序并按顺序取出时间点
-    top_pauses.sort(key=lambda x: x[0])  # Sort chronologically
-    
-    # 5. 取这些0段的两端作为分割点, 中间分出有动作的段
+    top_pauses.sort(key=lambda x: x[0])
+
+    actual_segments = len(top_pauses) - 1
+    if required_pauses <= 1:
+        raise ValueError(f"Found only {len(blocks)} zero blocks with threshold {zero_threshold}.")
+
     action_intervals = []
     action_lengths = []
     for i in range(actual_segments):
-        action_start = top_pauses[i][0] + top_pauses[i][1]  # current 0-segment ends
-        action_end = top_pauses[i+1][0]                     # next 0-segment begins
-        
+        action_start = top_pauses[i][0] + top_pauses[i][1]
+        action_end = top_pauses[i + 1][0]
         if action_end <= action_start:
-            # Fallback if consecutive pauses touch (should not happen mathematically if they are distinct blocks)
             action_end = action_start + 1
-            
+
         action_intervals.append((action_start, action_end))
         action_lengths.append(action_end - action_start)
-        
-    # 6. 根据最长动作段长度, 将其他段向两边延展(统一补齐至相同长度)
+
     max_action_len = max(action_lengths)
-    
     segments = []
     for i in range(actual_segments):
         a_start, a_end = action_intervals[i]
         pad_total = max_action_len - (a_end - a_start)
         pad_left = pad_total // 2
         pad_right = pad_total - pad_left
-        
-        # Extend into the original data naturally
+
         s_start = a_start - pad_left
         s_end = a_end + pad_right
-        
-        # Ensure we don't go out of bounds of the file!
+
         if s_start < 0:
             shift = -s_start
             s_start += shift
@@ -323,9 +289,9 @@ def find_action_boundaries(
             shift = s_end - len(data)
             s_start -= shift
             s_end -= shift
-            
+
         segments.append((s_start, s_end))
-        
+
     return segments
 
 
