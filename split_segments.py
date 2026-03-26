@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import shutil
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--segment-method",
-        choices=["auto", "pause_search", "peak_pair"],
+        choices=["auto", "pause_search", "peak_pair", "pause_peak_hybrid"],
         default="auto",
         help="Segmentation strategy to use. 'auto' runs both and keeps the better valid result.",
     )
@@ -303,13 +304,16 @@ def score_action_intervals(action_intervals: list[tuple[int, int]]) -> float:
     return float(lengths.std() / median_length + lengths.max() / median_length)
 
 
-def segment_with_pause_search(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
-    """Search over zero thresholds and keep the most stable valid 100-segment solution."""
+def build_pause_candidates(
+    data: np.ndarray,
+    segments_per_file: int,
+) -> list[tuple[float, list[tuple[int, int]], list[tuple[int, int]], dict[str, float | int | bool | str]]]:
+    """Return valid pause-search candidates before fixed-length padding."""
     exg = data[:, 1:5]
     diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
     diffs_padded = np.append(diffs, diffs[-1])
     envelope = np.convolve(diffs_padded, np.ones(10) / 10, mode="same")
-    best: tuple[float, list[tuple[int, int]], dict[str, float | int | bool | str]] | None = None
+    candidates: list[tuple[float, list[tuple[int, int]], list[tuple[int, int]], dict[str, float | int | bool | str]]] = []
 
     for zero_threshold in range(200, 2001, 50):
         pauses = sorted(extract_zero_blocks(envelope < zero_threshold), key=lambda item: item[0])
@@ -339,13 +343,20 @@ def segment_with_pause_search(data: np.ndarray, segments_per_file: int) -> tuple
             "segment_length_median": float(np.median([end - start for start, end in action_intervals])),
             "segment_length_max": int(max(end - start for start, end in action_intervals)),
         }
-        if best is None or score < best[0]:
-            best = (score, action_intervals, metrics)
+        candidates.append((score, list(pauses), action_intervals, metrics))
+
+    return candidates
+
+
+def segment_with_pause_search(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
+    """Search over zero thresholds and keep the most stable valid 100-segment solution."""
+    candidates = build_pause_candidates(data, segments_per_file)
+    best = min(candidates, key=lambda item: item[0]) if candidates else None
 
     if best is None:
         raise ValueError("Pause-search method could not find a valid 100-segment solution.")
 
-    return pad_action_intervals(len(data), best[1]), best[2]
+    return pad_action_intervals(len(data), best[2]), best[3]
 
 
 def pair_peak_sequences(maxima: np.ndarray, minima: np.ndarray, max_gap: int) -> list[tuple[int, int]]:
@@ -355,6 +366,60 @@ def pair_peak_sequences(maxima: np.ndarray, minima: np.ndarray, max_gap: int) ->
             continue
         pairs.append((int(max_idx), int(min_idx)))
     return pairs
+
+
+def validate_window_edges(signal_1d: np.ndarray, windows: list[tuple[int, int]], threshold: float = 1000.0) -> bool:
+    return all(abs(float(signal_1d[start])) < threshold and abs(float(signal_1d[end - 1])) < threshold for start, end in windows)
+
+
+def select_exact_non_overlapping_windows(
+    candidates: list[dict[str, float | int]], segments_per_file: int
+) -> list[dict[str, float | int]] | None:
+    if len(candidates) < segments_per_file:
+        return None
+
+    windows = sorted(candidates, key=lambda item: (int(item["end"]), int(item["start"])))
+    ends = [int(item["end"]) for item in windows]
+    prev = [bisect_right(ends, int(item["start"])) - 1 for item in windows]
+
+    neg_inf = float("-inf")
+    n = len(windows)
+    dp = [[neg_inf] * (segments_per_file + 1) for _ in range(n + 1)]
+    take = [[False] * (segments_per_file + 1) for _ in range(n + 1)]
+    parent = [[0] * (segments_per_file + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+
+    for i in range(1, n + 1):
+        window = windows[i - 1]
+        for j in range(segments_per_file + 1):
+            dp[i][j] = dp[i - 1][j]
+            parent[i][j] = i - 1
+        for j in range(1, segments_per_file + 1):
+            prev_idx = prev[i - 1] + 1
+            if dp[prev_idx][j - 1] == neg_inf:
+                continue
+            candidate_score = dp[prev_idx][j - 1] + float(window["strength"])
+            if candidate_score > dp[i][j]:
+                dp[i][j] = candidate_score
+                take[i][j] = True
+                parent[i][j] = prev_idx
+
+    if dp[n][segments_per_file] == neg_inf:
+        return None
+
+    picked: list[dict[str, float | int]] = []
+    i = n
+    j = segments_per_file
+    while i > 0 and j > 0:
+        if take[i][j]:
+            picked.append(windows[i - 1])
+            i = parent[i][j]
+            j -= 1
+        else:
+            i -= 1
+
+    picked.reverse()
+    return picked
 
 
 def segment_with_peak_pair(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
@@ -407,6 +472,87 @@ def segment_with_peak_pair(data: np.ndarray, segments_per_file: int) -> tuple[li
     return action_intervals, metrics
 
 
+def segment_with_pause_peak_hybrid(
+    data: np.ndarray, segments_per_file: int
+) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
+    """Use pause-derived intervals for candidate peak alignment, then pick 100 non-overlapping windows."""
+    exg = data[:, 1:5]
+    channel_scores = compute_channel_scores(exg)
+    ref_idx = int(np.argmax([channel_scores[f"ch{i + 1}"] for i in range(4)]))
+    ref_signal = exg[:, ref_idx]
+    exg_diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
+    envelope = np.convolve(np.append(exg_diffs, exg_diffs[-1]), np.ones(10) / 10, mode="same")
+
+    best: tuple[float, list[tuple[int, int]], dict[str, float | int | bool | str]] | None = None
+    for zero_threshold in range(200, 2001, 50):
+        pauses = sorted(extract_zero_blocks(envelope < zero_threshold), key=lambda item: item[0])
+        if len(pauses) < 2:
+            continue
+
+        raw_intervals = build_action_intervals(len(data), pauses)
+        window_candidates: list[dict[str, float | int]] = []
+        for interval_start, interval_end in raw_intervals:
+            interval_length = interval_end - interval_start
+            if interval_length < 2:
+                continue
+            interval_signal = ref_signal[interval_start:interval_end]
+            max_local = int(np.argmax(interval_signal))
+            min_local = int(np.argmin(interval_signal))
+            max_idx = interval_start + max_local
+            min_idx = interval_start + min_local
+            pair_gap = abs(max_idx - min_idx)
+            if pair_gap >= 200:
+                continue
+
+            center = int(round((max_idx + min_idx) / 2))
+            half = interval_length // 2
+            start = max(0, center - half)
+            end = min(len(data), start + interval_length)
+            start = max(0, end - interval_length)
+            window_candidates.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "strength": abs(float(ref_signal[max_idx] - ref_signal[min_idx])),
+                    "pair_gap": pair_gap,
+                    "window_length": interval_length,
+                }
+            )
+
+        selected = select_exact_non_overlapping_windows(window_candidates, segments_per_file)
+        if selected is None:
+            continue
+
+        raw_windows = [(int(item["start"]), int(item["end"])) for item in selected]
+        pair_gaps = [int(item["pair_gap"]) for item in selected]
+        window_lengths = [int(item["window_length"]) for item in selected]
+        total_strength = float(sum(float(item["strength"]) for item in selected))
+        padded_windows = pad_action_intervals(len(data), raw_windows)
+        edge_ok = validate_window_edges(ref_signal, padded_windows, threshold=1000.0)
+        metrics: dict[str, float | int | bool | str] = {
+            "valid": True,
+            "score": -total_strength,
+            "reference_channel": f"ch{ref_idx + 1}",
+            "source_zero_threshold": float(zero_threshold),
+            "candidate_windows_found": len(window_candidates),
+            "segments_detected": len(raw_windows),
+            "pair_gap_max": int(max(pair_gaps)),
+            "pair_gap_median": float(np.median(pair_gaps)),
+            "edge_below_1000": edge_ok,
+            "segment_length_min": int(min(window_lengths)),
+            "segment_length_median": float(np.median(window_lengths)),
+            "segment_length_max": int(max(window_lengths)),
+            "padded_segment_length": int(max(end - start for start, end in padded_windows)),
+        }
+        if best is None or total_strength > -best[0]:
+            best = (-total_strength, padded_windows, metrics)
+
+    if best is None:
+        raise ValueError("Pause-peak hybrid method could not find 100 non-overlapping aligned windows.")
+
+    return best[1], best[2]
+
+
 def find_action_boundaries(
     data: np.ndarray,
     source_rows: np.ndarray,
@@ -415,7 +561,7 @@ def find_action_boundaries(
     method: str = "auto",
 ) -> tuple[list[tuple[int, int]], str, dict[str, dict[str, float | int | bool | str]]]:
     del source_rows, pause_tol
-    methods = [method] if method != "auto" else ["pause_search", "peak_pair"]
+    methods = [method] if method != "auto" else ["pause_search", "peak_pair", "pause_peak_hybrid"]
     results: dict[str, tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]] = {}
     errors: dict[str, str] = {}
 
@@ -425,6 +571,8 @@ def find_action_boundaries(
                 results[name] = segment_with_pause_search(data, segments_per_file)
             elif name == "peak_pair":
                 results[name] = segment_with_peak_pair(data, segments_per_file)
+            elif name == "pause_peak_hybrid":
+                results[name] = segment_with_pause_peak_hybrid(data, segments_per_file)
             else:
                 raise ValueError(f"Unknown segmentation method: {name}")
         except Exception as exc:
