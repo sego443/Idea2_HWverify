@@ -33,6 +33,8 @@ class RecordingResult:
     direction: str
     anchor_channel: str
     channel_scores: dict[str, float]
+    segmentation_method: str
+    segmentation_metrics: dict[str, dict[str, float | int | bool | str]]
     segment_length: int
     total_action_samples: int
     used_samples: int
@@ -95,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         "--skip-segment-viz",
         action="store_true",
         help="Skip overview/detail/sensitivity plots for segmented outputs",
+    )
+    parser.add_argument(
+        "--segment-method",
+        choices=["auto", "pause_search", "peak_pair"],
+        default="auto",
+        help="Segmentation strategy to use. 'auto' runs both and keeps the better valid result.",
     )
     return parser.parse_args()
 
@@ -210,70 +218,65 @@ def compute_channel_scores(samples: np.ndarray) -> dict[str, float]:
     return scores
 
 
-def find_action_boundaries(
-    data: np.ndarray, source_rows: np.ndarray, pause_tol: float, segments_per_file: int = 100
-) -> list[tuple[int, int]]:
-    """Identify action segment boundaries using the specified zero-segment logic.
+def build_action_intervals(total_length: int, pauses: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Build action intervals using file start/end as implicit boundaries."""
+    action_intervals: list[tuple[int, int]] = []
+    prev_end = 0
+    for start, length in pauses:
+        if start > prev_end:
+            action_intervals.append((prev_end, start))
+        prev_end = start + length
 
-    1. Compute the per-sample fluctuation envelope on ch1-4.
-    2. Treat fluctuation values < 1000 as 0 (pause regions).
-    3. Find all zero blocks, measure lengths, and pick the top 101 longest.
-    4. Sort these zero blocks chronologically.
-    5. The 100 regions between adjacent zero blocks are the action bounds.
-    6. Pad each action interval symmetrically on the original data to match the longest action.
-    """
-    exg = data[:, 1:5]
+    if prev_end < total_length:
+        action_intervals.append((prev_end, total_length))
+    return action_intervals
 
-    # Use inter-sample fluctuation to identify pause regions rather than absolute level.
-    diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
-    diffs_padded = np.append(diffs, diffs[-1])
-    envelope = np.convolve(diffs_padded, np.ones(10) / 10, mode="same")
 
-    zero_threshold = 1000.0
-    is_zero = envelope < zero_threshold
-
-    # Find all zero blocks and measure their lengths.
-    blocks = []
+def extract_zero_blocks(mask: np.ndarray) -> list[tuple[int, int]]:
+    blocks: list[tuple[int, int]] = []
     i = 0
-    while i < len(is_zero):
-        if is_zero[i]:
+    while i < len(mask):
+        if mask[i]:
             start = i
-            while i < len(is_zero) and is_zero[i]:
+            while i < len(mask) and mask[i]:
                 i += 1
             blocks.append((start, i - start))
         else:
             i += 1
+    return blocks
 
-    blocks.sort(key=lambda x: x[1], reverse=True)
-    required_pauses = segments_per_file + 1
-    if len(blocks) < required_pauses:
-        raise ValueError(
-            f"Found only {len(blocks)} zero blocks with threshold {zero_threshold}, "
-            f"not enough to extract {segments_per_file} segments."
-        )
 
-    top_pauses = blocks[:required_pauses]
-    top_pauses.sort(key=lambda x: x[0])
+def choose_pause_to_remove(
+    pauses: list[tuple[int, int]],
+    action_intervals: list[tuple[int, int]],
+    action_index: int,
+) -> int | None:
+    """Remove the adjacent pause that yields a merged action closest to the current median length."""
+    action_lengths = np.asarray([end - start for start, end in action_intervals], dtype=float)
+    target_length = float(np.median(action_lengths))
+    candidates: list[tuple[float, int]] = []
 
-    actual_segments = len(top_pauses) - 1
-    if required_pauses <= 1:
-        raise ValueError(f"Found only {len(blocks)} zero blocks with threshold {zero_threshold}.")
+    if action_index > 0:
+        left_pause_idx = action_index - 1
+        merged_left = action_intervals[action_index][1] - action_intervals[action_index - 1][0]
+        candidates.append((abs(merged_left - target_length), left_pause_idx))
 
-    action_intervals = []
-    action_lengths = []
-    for i in range(actual_segments):
-        action_start = top_pauses[i][0] + top_pauses[i][1]
-        action_end = top_pauses[i + 1][0]
-        if action_end <= action_start:
-            action_end = action_start + 1
+    if action_index < len(action_intervals) - 1:
+        right_pause_idx = action_index
+        merged_right = action_intervals[action_index + 1][1] - action_intervals[action_index][0]
+        candidates.append((abs(merged_right - target_length), right_pause_idx))
 
-        action_intervals.append((action_start, action_end))
-        action_lengths.append(action_end - action_start)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
+
+def pad_action_intervals(data_length: int, action_intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    action_lengths = [end - start for start, end in action_intervals]
     max_action_len = max(action_lengths)
-    segments = []
-    for i in range(actual_segments):
-        a_start, a_end = action_intervals[i]
+    segments: list[tuple[int, int]] = []
+    for a_start, a_end in action_intervals:
         pad_total = max_action_len - (a_end - a_start)
         pad_left = pad_total // 2
         pad_right = pad_total - pad_left
@@ -285,14 +288,162 @@ def find_action_boundaries(
             shift = -s_start
             s_start += shift
             s_end += shift
-        if s_end > len(data):
-            shift = s_end - len(data)
+        if s_end > data_length:
+            shift = s_end - data_length
             s_start -= shift
             s_end -= shift
 
         segments.append((s_start, s_end))
-
     return segments
+
+
+def score_action_intervals(action_intervals: list[tuple[int, int]]) -> float:
+    lengths = np.asarray([end - start for start, end in action_intervals], dtype=float)
+    median_length = float(np.median(lengths))
+    return float(lengths.std() / median_length + lengths.max() / median_length)
+
+
+def segment_with_pause_search(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
+    """Search over zero thresholds and keep the most stable valid 100-segment solution."""
+    exg = data[:, 1:5]
+    diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
+    diffs_padded = np.append(diffs, diffs[-1])
+    envelope = np.convolve(diffs_padded, np.ones(10) / 10, mode="same")
+    best: tuple[float, list[tuple[int, int]], dict[str, float | int | bool | str]] | None = None
+
+    for zero_threshold in range(200, 2001, 50):
+        pauses = sorted(extract_zero_blocks(envelope < zero_threshold), key=lambda item: item[0])
+        if len(pauses) < 2:
+            continue
+
+        action_intervals = build_action_intervals(len(data), pauses)
+        while len(action_intervals) > segments_per_file:
+            action_lengths = np.asarray([end - start for start, end in action_intervals], dtype=float)
+            shortest_idx = int(np.argmin(action_lengths))
+            pause_idx = choose_pause_to_remove(pauses, action_intervals, shortest_idx)
+            if pause_idx is None:
+                break
+            pauses.pop(pause_idx)
+            action_intervals = build_action_intervals(len(data), pauses)
+
+        if len(action_intervals) != segments_per_file:
+            continue
+
+        score = score_action_intervals(action_intervals)
+        metrics: dict[str, float | int | bool | str] = {
+            "valid": True,
+            "score": score,
+            "zero_threshold": float(zero_threshold),
+            "segments_detected": len(action_intervals),
+            "segment_length_min": int(min(end - start for start, end in action_intervals)),
+            "segment_length_median": float(np.median([end - start for start, end in action_intervals])),
+            "segment_length_max": int(max(end - start for start, end in action_intervals)),
+        }
+        if best is None or score < best[0]:
+            best = (score, action_intervals, metrics)
+
+    if best is None:
+        raise ValueError("Pause-search method could not find a valid 100-segment solution.")
+
+    return pad_action_intervals(len(data), best[1]), best[2]
+
+
+def pair_peak_sequences(maxima: np.ndarray, minima: np.ndarray, max_gap: int) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    for max_idx, min_idx in zip(np.sort(maxima), np.sort(minima)):
+        if abs(int(max_idx) - int(min_idx)) > max_gap:
+            continue
+        pairs.append((int(max_idx), int(min_idx)))
+    return pairs
+
+
+def segment_with_peak_pair(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
+    """Use the strongest channel's extrema pairs as segment centers."""
+    exg = data[:, 1:5]
+    channel_scores = compute_channel_scores(exg)
+    ref_idx = int(np.argmax([channel_scores[f"ch{i + 1}"] for i in range(4)]))
+    ref_signal = exg[:, ref_idx]
+
+    maxima, _ = signal.find_peaks(ref_signal, distance=80)
+    minima, _ = signal.find_peaks(-ref_signal, distance=80)
+    if maxima.size < segments_per_file or minima.size < segments_per_file:
+        raise ValueError(
+            f"Peak-pair method found only {maxima.size} maxima and {minima.size} minima on reference channel."
+        )
+
+    maxima = maxima[np.argsort(ref_signal[maxima])[-segments_per_file:]]
+    minima = minima[np.argsort((-ref_signal[minima]))[-segments_per_file:]]
+    pairs = pair_peak_sequences(maxima, minima, max_gap=200)
+    if len(pairs) != segments_per_file:
+        raise ValueError(f"Peak-pair method produced {len(pairs)} valid max/min pairs; expected {segments_per_file}.")
+
+    action_intervals: list[tuple[int, int]] = []
+    edge_ok = True
+    for max_idx, min_idx in pairs:
+        center = int(round((max_idx + min_idx) / 2))
+        start = max(0, center - 140)
+        end = min(len(data), center + 140)
+        if end - start < 280:
+            if start == 0:
+                end = min(len(data), 280)
+            elif end == len(data):
+                start = max(0, len(data) - 280)
+        action_intervals.append((start, end))
+        edge_ok = edge_ok and abs(ref_signal[start]) < 1000 and abs(ref_signal[end - 1]) < 1000
+
+    action_intervals.sort(key=lambda item: item[0])
+    lengths = [end - start for start, end in action_intervals]
+    metrics: dict[str, float | int | bool | str] = {
+        "valid": len(action_intervals) == segments_per_file,
+        "score": score_action_intervals(action_intervals),
+        "reference_channel": f"ch{ref_idx + 1}",
+        "paired_extrema_max_gap": int(max(abs(max_idx - min_idx) for max_idx, min_idx in pairs)),
+        "edge_below_1000": edge_ok,
+        "segments_detected": len(action_intervals),
+        "segment_length_min": int(min(lengths)),
+        "segment_length_median": float(np.median(lengths)),
+        "segment_length_max": int(max(lengths)),
+    }
+    return action_intervals, metrics
+
+
+def find_action_boundaries(
+    data: np.ndarray,
+    source_rows: np.ndarray,
+    pause_tol: float,
+    segments_per_file: int = 100,
+    method: str = "auto",
+) -> tuple[list[tuple[int, int]], str, dict[str, dict[str, float | int | bool | str]]]:
+    del source_rows, pause_tol
+    methods = [method] if method != "auto" else ["pause_search", "peak_pair"]
+    results: dict[str, tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]] = {}
+    errors: dict[str, str] = {}
+
+    for name in methods:
+        try:
+            if name == "pause_search":
+                results[name] = segment_with_pause_search(data, segments_per_file)
+            elif name == "peak_pair":
+                results[name] = segment_with_peak_pair(data, segments_per_file)
+            else:
+                raise ValueError(f"Unknown segmentation method: {name}")
+        except Exception as exc:
+            errors[name] = str(exc)
+
+    if not results:
+        raise ValueError("All segmentation methods failed: " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+
+    if method == "auto":
+        chosen_method = min(results.items(), key=lambda item: float(item[1][1]["score"]))[0]
+    else:
+        chosen_method = method
+        if chosen_method not in results:
+            raise ValueError(errors.get(chosen_method, f"Segmentation method failed: {chosen_method}"))
+
+    metrics = {name: info[1] for name, info in results.items()}
+    for name, message in errors.items():
+        metrics[name] = {"valid": False, "error": message}
+    return results[chosen_method][0], chosen_method, metrics
 
 
 def process_file(
@@ -301,6 +452,7 @@ def process_file(
     pause_tol: float,
     processed_dir: Path,
     qc_dir: Path | None,
+    segment_method: str,
 ) -> tuple[RecordingResult, Path, Path | None]:
     processed_path = process_playback_file(
         input_file=path,
@@ -327,7 +479,13 @@ def process_file(
     if post.size == 0:
         raise ValueError(f"No data remains after initial transient removal in {path}")
 
-    boundaries = find_action_boundaries(post, post_src, pause_tol=pause_tol, segments_per_file=segments_per_file)
+    boundaries, chosen_method, segmentation_metrics = find_action_boundaries(
+        post,
+        post_src,
+        pause_tol=pause_tol,
+        segments_per_file=segments_per_file,
+        method=segment_method,
+    )
     
     if len(boundaries) != segments_per_file:
         print(f"Warning: Expected {segments_per_file} action segments in {path.name}, but identified {len(boundaries)} due to dropped blocks.")
@@ -357,6 +515,8 @@ def process_file(
             direction=extract_direction(path),
             anchor_channel=anchor,
             channel_scores=channel_scores,
+            segmentation_method=chosen_method,
+            segmentation_metrics=segmentation_metrics,
             segment_length=int(max_length),
             total_action_samples=int(all_action.shape[0]),
             used_samples=int(all_action.shape[0]),
@@ -386,6 +546,8 @@ def save_result(output_dir: Path, result: RecordingResult, processed_path: Path,
         "direction": direction,
         "anchor_channel": result.anchor_channel,
         "channel_scores": result.channel_scores,
+        "segmentation_method": result.segmentation_method,
+        "segmentation_metrics": result.segmentation_metrics,
         "segments": int(segments_array.shape[0]),
         "segment_length": int(result.segment_length),
         "total_action_samples": int(result.total_action_samples),
@@ -480,6 +642,7 @@ def main() -> None:
             pause_tol=args.pause_tol,
             processed_dir=processed_dir,
             qc_dir=qc_dir,
+            segment_method=args.segment_method,
         )
         summaries.append(save_result(output_dir, result, processed_path, qc_path))
 
@@ -501,7 +664,8 @@ def main() -> None:
         print(
             f"- {item['direction']}: segments={item['segments']}, "
             f"length={item['segment_length']}, "
-            f"anchor={item['anchor_channel']}"
+            f"anchor={item['anchor_channel']}, "
+            f"method={item['segmentation_method']}"
         )
 
 
