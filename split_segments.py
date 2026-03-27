@@ -219,6 +219,12 @@ def compute_channel_scores(samples: np.ndarray) -> dict[str, float]:
     return scores
 
 
+def choose_anchor_channel(samples: np.ndarray) -> tuple[int, str, dict[str, float]]:
+    scores = compute_channel_scores(samples)
+    anchor_idx = int(np.argmax([scores[f"ch{i + 1}"] for i in range(4)]))
+    return anchor_idx, f"ch{anchor_idx + 1}", scores
+
+
 def build_action_intervals(total_length: int, pauses: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Build action intervals using file start/end as implicit boundaries."""
     action_intervals: list[tuple[int, int]] = []
@@ -273,17 +279,29 @@ def choose_pause_to_remove(
     return candidates[0][1]
 
 
-def pad_action_intervals(data_length: int, action_intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+def pad_action_intervals(
+    data_length: int,
+    action_intervals: list[tuple[int, int]],
+    allow_edge_zero_pad: bool = False,
+) -> list[tuple[int, int]]:
     action_lengths = [end - start for start, end in action_intervals]
     max_action_len = max(action_lengths)
     segments: list[tuple[int, int]] = []
-    for a_start, a_end in action_intervals:
+    last_idx = len(action_intervals) - 1
+    for idx, (a_start, a_end) in enumerate(action_intervals):
         pad_total = max_action_len - (a_end - a_start)
         pad_left = pad_total // 2
         pad_right = pad_total - pad_left
 
         s_start = a_start - pad_left
         s_end = a_end + pad_right
+
+        if allow_edge_zero_pad and idx == 0 and s_start < 0:
+            segments.append((s_start, s_end))
+            continue
+        if allow_edge_zero_pad and idx == last_idx and s_end > data_length:
+            segments.append((s_start, s_end))
+            continue
 
         if s_start < 0:
             shift = -s_start
@@ -306,17 +324,15 @@ def score_action_intervals(action_intervals: list[tuple[int, int]]) -> float:
 
 def build_pause_candidates(
     data: np.ndarray,
+    ref_signal: np.ndarray,
+    reference_channel: str,
     segments_per_file: int,
 ) -> list[tuple[float, list[tuple[int, int]], list[tuple[int, int]], dict[str, float | int | bool | str]]]:
     """Return valid pause-search candidates before fixed-length padding."""
-    exg = data[:, 1:5]
-    diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
-    diffs_padded = np.append(diffs, diffs[-1])
-    envelope = np.convolve(diffs_padded, np.ones(10) / 10, mode="same")
     candidates: list[tuple[float, list[tuple[int, int]], list[tuple[int, int]], dict[str, float | int | bool | str]]] = []
 
     for zero_threshold in range(200, 2001, 50):
-        pauses = sorted(extract_zero_blocks(envelope < zero_threshold), key=lambda item: item[0])
+        pauses = sorted(extract_zero_blocks(np.abs(ref_signal) < zero_threshold), key=lambda item: item[0])
         if len(pauses) < 2:
             continue
 
@@ -337,6 +353,7 @@ def build_pause_candidates(
         metrics: dict[str, float | int | bool | str] = {
             "valid": True,
             "score": score,
+            "reference_channel": reference_channel,
             "zero_threshold": float(zero_threshold),
             "segments_detected": len(action_intervals),
             "segment_length_min": int(min(end - start for start, end in action_intervals)),
@@ -348,9 +365,14 @@ def build_pause_candidates(
     return candidates
 
 
-def segment_with_pause_search(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
+def segment_with_pause_search(
+    data: np.ndarray,
+    ref_signal: np.ndarray,
+    reference_channel: str,
+    segments_per_file: int,
+) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
     """Search over zero thresholds and keep the most stable valid 100-segment solution."""
-    candidates = build_pause_candidates(data, segments_per_file)
+    candidates = build_pause_candidates(data, ref_signal, reference_channel, segments_per_file)
     best = min(candidates, key=lambda item: item[0]) if candidates else None
 
     if best is None:
@@ -369,7 +391,12 @@ def pair_peak_sequences(maxima: np.ndarray, minima: np.ndarray, max_gap: int) ->
 
 
 def validate_window_edges(signal_1d: np.ndarray, windows: list[tuple[int, int]], threshold: float = 1000.0) -> bool:
-    return all(abs(float(signal_1d[start])) < threshold and abs(float(signal_1d[end - 1])) < threshold for start, end in windows)
+    for start, end in windows:
+        left_value = 0.0 if start < 0 else float(signal_1d[start])
+        right_value = 0.0 if end > len(signal_1d) else float(signal_1d[end - 1])
+        if abs(left_value) >= threshold or abs(right_value) >= threshold:
+            return False
+    return True
 
 
 def select_exact_non_overlapping_windows(
@@ -422,13 +449,39 @@ def select_exact_non_overlapping_windows(
     return picked
 
 
-def segment_with_peak_pair(data: np.ndarray, segments_per_file: int) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
-    """Use the strongest channel's extrema pairs as segment centers."""
-    exg = data[:, 1:5]
-    channel_scores = compute_channel_scores(exg)
-    ref_idx = int(np.argmax([channel_scores[f"ch{i + 1}"] for i in range(4)]))
-    ref_signal = exg[:, ref_idx]
+def extract_segment_window(
+    data: np.ndarray,
+    source_rows: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    clip_start = max(0, start_idx)
+    clip_end = min(len(data), end_idx)
+    seg_data = data[clip_start:clip_end, 1:5]
+    seg_src = source_rows[clip_start:clip_end]
 
+    pad_before = max(0, -start_idx)
+    pad_after = max(0, end_idx - len(data))
+    if pad_before or pad_after:
+        seg_data = np.pad(seg_data, ((pad_before, pad_after), (0, 0)), mode="constant", constant_values=0.0)
+        seg_src = np.concatenate(
+            [
+                np.full(pad_before, -1, dtype=source_rows.dtype),
+                seg_src,
+                np.full(pad_after, -1, dtype=source_rows.dtype),
+            ]
+        )
+
+    return seg_data, seg_src
+
+
+def segment_with_peak_pair(
+    data: np.ndarray,
+    ref_signal: np.ndarray,
+    reference_channel: str,
+    segments_per_file: int,
+) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
+    """Use the anchor channel's extrema pairs as segment centers."""
     maxima, _ = signal.find_peaks(ref_signal, distance=80)
     minima, _ = signal.find_peaks(-ref_signal, distance=80)
     if maxima.size < segments_per_file or minima.size < segments_per_file:
@@ -461,7 +514,7 @@ def segment_with_peak_pair(data: np.ndarray, segments_per_file: int) -> tuple[li
     metrics: dict[str, float | int | bool | str] = {
         "valid": len(action_intervals) == segments_per_file,
         "score": score_action_intervals(action_intervals),
-        "reference_channel": f"ch{ref_idx + 1}",
+        "reference_channel": reference_channel,
         "paired_extrema_max_gap": int(max(abs(max_idx - min_idx) for max_idx, min_idx in pairs)),
         "edge_below_1000": edge_ok,
         "segments_detected": len(action_intervals),
@@ -473,19 +526,15 @@ def segment_with_peak_pair(data: np.ndarray, segments_per_file: int) -> tuple[li
 
 
 def segment_with_pause_peak_hybrid(
-    data: np.ndarray, segments_per_file: int
+    data: np.ndarray,
+    ref_signal: np.ndarray,
+    reference_channel: str,
+    segments_per_file: int,
 ) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
-    """Use pause-derived intervals for candidate peak alignment, then pick 100 non-overlapping windows."""
-    exg = data[:, 1:5]
-    channel_scores = compute_channel_scores(exg)
-    ref_idx = int(np.argmax([channel_scores[f"ch{i + 1}"] for i in range(4)]))
-    ref_signal = exg[:, ref_idx]
-    exg_diffs = np.max(np.abs(np.diff(exg, axis=0)), axis=1)
-    envelope = np.convolve(np.append(exg_diffs, exg_diffs[-1]), np.ones(10) / 10, mode="same")
-
+    """Use anchor-derived pause intervals and anchor peaks, then pick 100 non-overlapping windows."""
     best: tuple[float, list[tuple[int, int]], dict[str, float | int | bool | str]] | None = None
     for zero_threshold in range(200, 2001, 50):
-        pauses = sorted(extract_zero_blocks(envelope < zero_threshold), key=lambda item: item[0])
+        pauses = sorted(extract_zero_blocks(np.abs(ref_signal) < zero_threshold), key=lambda item: item[0])
         if len(pauses) < 2:
             continue
 
@@ -505,10 +554,9 @@ def segment_with_pause_peak_hybrid(
                 continue
 
             center = int(round((max_idx + min_idx) / 2))
-            half = interval_length // 2
-            start = max(0, center - half)
-            end = min(len(data), start + interval_length)
-            start = max(0, end - interval_length)
+            front_span = max(0, interval_length // 2 - 50)
+            start = center - front_span
+            end = start + interval_length
             window_candidates.append(
                 {
                     "start": start,
@@ -527,12 +575,12 @@ def segment_with_pause_peak_hybrid(
         pair_gaps = [int(item["pair_gap"]) for item in selected]
         window_lengths = [int(item["window_length"]) for item in selected]
         total_strength = float(sum(float(item["strength"]) for item in selected))
-        padded_windows = pad_action_intervals(len(data), raw_windows)
+        padded_windows = pad_action_intervals(len(data), raw_windows, allow_edge_zero_pad=True)
         edge_ok = validate_window_edges(ref_signal, padded_windows, threshold=1000.0)
         metrics: dict[str, float | int | bool | str] = {
             "valid": True,
             "score": -total_strength,
-            "reference_channel": f"ch{ref_idx + 1}",
+            "reference_channel": reference_channel,
             "source_zero_threshold": float(zero_threshold),
             "candidate_windows_found": len(window_candidates),
             "segments_detected": len(raw_windows),
@@ -559,8 +607,11 @@ def find_action_boundaries(
     pause_tol: float,
     segments_per_file: int = 100,
     method: str = "auto",
+    anchor_idx: int = 0,
+    anchor_channel: str = "ch1",
 ) -> tuple[list[tuple[int, int]], str, dict[str, dict[str, float | int | bool | str]]]:
     del source_rows, pause_tol
+    ref_signal = data[:, 1 + anchor_idx]
     methods = [method] if method != "auto" else ["pause_search", "peak_pair", "pause_peak_hybrid"]
     results: dict[str, tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]] = {}
     errors: dict[str, str] = {}
@@ -568,11 +619,11 @@ def find_action_boundaries(
     for name in methods:
         try:
             if name == "pause_search":
-                results[name] = segment_with_pause_search(data, segments_per_file)
+                results[name] = segment_with_pause_search(data, ref_signal, anchor_channel, segments_per_file)
             elif name == "peak_pair":
-                results[name] = segment_with_peak_pair(data, segments_per_file)
+                results[name] = segment_with_peak_pair(data, ref_signal, anchor_channel, segments_per_file)
             elif name == "pause_peak_hybrid":
-                results[name] = segment_with_pause_peak_hybrid(data, segments_per_file)
+                results[name] = segment_with_pause_peak_hybrid(data, ref_signal, anchor_channel, segments_per_file)
             else:
                 raise ValueError(f"Unknown segmentation method: {name}")
         except Exception as exc:
@@ -619,20 +670,23 @@ def process_file(
 
     data, source_rows = load_processed_recording(processed_path)
 
-    # Drop the first 2 seconds of data to remove initial transient (assuming 250Hz sampling rate)
-    first_valid = int(2.0 * 250.0)
+    # Drop the first 1 second of data to remove the initial transient (assuming 250Hz sampling rate)
+    first_valid = int(1.0 * 250.0)
 
     post = data[first_valid:]
     post_src = source_rows[first_valid:]
     if post.size == 0:
         raise ValueError(f"No data remains after initial transient removal in {path}")
 
+    anchor_idx, anchor, pre_segment_scores = choose_anchor_channel(post[:, 1:5])
     boundaries, chosen_method, segmentation_metrics = find_action_boundaries(
         post,
         post_src,
         pause_tol=pause_tol,
         segments_per_file=segments_per_file,
         method=segment_method,
+        anchor_idx=anchor_idx,
+        anchor_channel=anchor,
     )
     
     if len(boundaries) != segments_per_file:
@@ -643,8 +697,7 @@ def process_file(
     src_segments_list = []
     
     for start_idx, end_idx in boundaries:
-        seg_data = post[start_idx:end_idx, 1:5]
-        seg_src = post_src[start_idx:end_idx]
+        seg_data, seg_src = extract_segment_window(post, post_src, start_idx, end_idx)
         segments_list.append(seg_data)
         src_segments_list.append(seg_src)
 
@@ -652,17 +705,13 @@ def process_file(
     max_length = segments_list[0].shape[0]
     segments_array = np.array(segments_list, dtype=np.float32)  # shape=(100, L, 4)
 
-    # Compute channel scores on all exported action data
     all_action = np.vstack(segments_list)
-    channel_scores = compute_channel_scores(all_action)
-    anchor_idx = int(np.argmax([channel_scores[f"ch{i + 1}"] for i in range(4)]))
-    anchor = f"ch{anchor_idx + 1}"
 
     return (
         RecordingResult(
             direction=extract_direction(path),
             anchor_channel=anchor,
-            channel_scores=channel_scores,
+            channel_scores=pre_segment_scores,
             segmentation_method=chosen_method,
             segmentation_metrics=segmentation_metrics,
             segment_length=int(max_length),
