@@ -449,6 +449,14 @@ def select_exact_non_overlapping_windows(
     return picked
 
 
+def build_target_lengths(raw_lengths: list[int]) -> list[int]:
+    values = np.asarray(raw_lengths, dtype=float)
+    percentiles = [50, 60, 70, 80, 90, 95, 100]
+    targets = {max(32, int(round(np.percentile(values, p)))) for p in percentiles}
+    targets.update(range(220, 341, 20))
+    return sorted(targets)
+
+
 def extract_segment_window(
     data: np.ndarray,
     source_rows: np.ndarray,
@@ -531,15 +539,15 @@ def segment_with_pause_peak_hybrid(
     reference_channel: str,
     segments_per_file: int,
 ) -> tuple[list[tuple[int, int]], dict[str, float | int | bool | str]]:
-    """Use anchor-derived pause intervals and anchor peaks, then pick 100 non-overlapping windows."""
-    best: tuple[float, list[tuple[int, int]], dict[str, float | int | bool | str]] | None = None
+    """Use anchor-derived pause intervals and anchor peaks, then pick 100 final non-overlapping windows."""
+    best: tuple[float, int, float, list[tuple[int, int]], dict[str, float | int | bool | str]] | None = None
     for zero_threshold in range(200, 2001, 50):
         pauses = sorted(extract_zero_blocks(np.abs(ref_signal) < zero_threshold), key=lambda item: item[0])
         if len(pauses) < 2:
             continue
 
         raw_intervals = build_action_intervals(len(data), pauses)
-        window_candidates: list[dict[str, float | int]] = []
+        raw_candidates: list[dict[str, float | int]] = []
         for interval_start, interval_end in raw_intervals:
             interval_length = interval_end - interval_start
             if interval_length < 2:
@@ -554,51 +562,77 @@ def segment_with_pause_peak_hybrid(
                 continue
 
             center = int(round((max_idx + min_idx) / 2))
-            front_span = max(0, interval_length // 2 - 50)
-            start = center - front_span
-            end = start + interval_length
-            window_candidates.append(
+            raw_candidates.append(
                 {
-                    "start": start,
-                    "end": end,
+                    "center": center,
                     "strength": abs(float(ref_signal[max_idx] - ref_signal[min_idx])),
                     "pair_gap": pair_gap,
                     "window_length": interval_length,
                 }
             )
 
-        selected = select_exact_non_overlapping_windows(window_candidates, segments_per_file)
-        if selected is None:
+        if len(raw_candidates) < segments_per_file:
             continue
 
-        raw_windows = [(int(item["start"]), int(item["end"])) for item in selected]
-        pair_gaps = [int(item["pair_gap"]) for item in selected]
-        window_lengths = [int(item["window_length"]) for item in selected]
-        total_strength = float(sum(float(item["strength"]) for item in selected))
-        padded_windows = pad_action_intervals(len(data), raw_windows, allow_edge_zero_pad=True)
-        edge_ok = validate_window_edges(ref_signal, padded_windows, threshold=1000.0)
-        metrics: dict[str, float | int | bool | str] = {
-            "valid": True,
-            "score": -total_strength,
-            "reference_channel": reference_channel,
-            "source_zero_threshold": float(zero_threshold),
-            "candidate_windows_found": len(window_candidates),
-            "segments_detected": len(raw_windows),
-            "pair_gap_max": int(max(pair_gaps)),
-            "pair_gap_median": float(np.median(pair_gaps)),
-            "edge_below_1000": edge_ok,
-            "segment_length_min": int(min(window_lengths)),
-            "segment_length_median": float(np.median(window_lengths)),
-            "segment_length_max": int(max(window_lengths)),
-            "padded_segment_length": int(max(end - start for start, end in padded_windows)),
-        }
-        if best is None or total_strength > -best[0]:
-            best = (-total_strength, padded_windows, metrics)
+        raw_length_floor = max(32, int(round(np.percentile([int(item["window_length"]) for item in raw_candidates], 25))))
+        for target_length in build_target_lengths([int(item["window_length"]) for item in raw_candidates]):
+            final_candidates: list[dict[str, float | int]] = []
+            front_span = max(0, target_length // 2 - 75)
+            for item in raw_candidates:
+                if int(item["window_length"]) < raw_length_floor:
+                    continue
+                center = int(item["center"])
+                start = center - front_span
+                end = start + target_length
+                final_candidates.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "strength": float(item["strength"]),
+                        "pair_gap": int(item["pair_gap"]),
+                        "window_length": target_length,
+                    }
+                )
+
+            selected = select_exact_non_overlapping_windows(final_candidates, segments_per_file)
+            if selected is None:
+                continue
+
+            final_windows = [(int(item["start"]), int(item["end"])) for item in selected]
+            pair_gaps = [int(item["pair_gap"]) for item in selected]
+            total_strength = float(sum(float(item["strength"]) for item in selected))
+            edge_ok = validate_window_edges(ref_signal, final_windows, threshold=1000.0)
+            metrics: dict[str, float | int | bool | str] = {
+                "valid": True,
+                "score": -total_strength,
+                "reference_channel": reference_channel,
+                "source_zero_threshold": float(zero_threshold),
+                "min_raw_length_required": int(raw_length_floor),
+                "candidate_windows_found": len(raw_candidates),
+                "candidate_windows_after_length_filter": len(final_candidates),
+                "segments_detected": len(final_windows),
+                "pair_gap_max": int(max(pair_gaps)),
+                "pair_gap_median": float(np.median(pair_gaps)),
+                "edge_below_1000": edge_ok,
+                "segment_length_min": target_length,
+                "segment_length_median": float(target_length),
+                "segment_length_max": target_length,
+                "padded_segment_length": target_length,
+            }
+            length_penalty = abs(target_length - 300)
+            ranking_score = float(length_penalty)
+            if (
+                best is None
+                or ranking_score < best[0]
+                or (ranking_score == best[0] and target_length > best[1])
+                or (ranking_score == best[0] and target_length == best[1] and total_strength > best[2])
+            ):
+                best = (ranking_score, target_length, total_strength, final_windows, metrics)
 
     if best is None:
         raise ValueError("Pause-peak hybrid method could not find 100 non-overlapping aligned windows.")
 
-    return best[1], best[2]
+    return best[3], best[4]
 
 
 def find_action_boundaries(
